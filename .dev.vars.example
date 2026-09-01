@@ -1,0 +1,10 @@
+# Local development secrets for `wrangler dev`.
+#
+# Copy to `.dev.vars` (gitignored) and fill in. This file is the LOCAL
+# equivalent of `wrangler secret put` — the deployed Worker never reads it.
+#
+# Never put these in shutTheCube/.env.local: that is a Vite app, and Vite
+# bundles its variables into the JavaScript every player downloads.
+
+GOOGLE_CLIENT_SECRET="paste-the-secret-here"
+SESSION_SECRET="any-long-random-string-openssl-rand-base64-32"

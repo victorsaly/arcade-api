@@ -1,0 +1,16 @@
+{
+  "name": "arcade-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Leaderboard API for victorsaly.com's games — one Worker, one D1 table, every game.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4",
+    "wrangler": "^4.86.0"
+  }
+}

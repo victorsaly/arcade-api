@@ -1,0 +1,305 @@
+/**
+ * The arcade API: one Worker and one D1 table serving every game.
+ *
+ * Endpoints
+ *   GET  /v1/board?game&mode&period   the ranking, public
+ *   POST /v1/score                    submit a finished game, signed in
+ *   GET  /v1/me                       who am I, and where do I rank
+ *   PATCH/v1/me                       change my display name
+ *   DELETE /v1/me                     erase me and every score I set
+ *   GET  /v1/auth/start               begin the Google redirect
+ *   GET  /v1/auth/callback            Google returns here
+ *   POST /v1/auth/claim               trade the one-time code for a session
+ *
+ * The games stay entirely playable when this is unreachable. Nothing here is
+ * on the critical path of a game of dice.
+ */
+
+import { authorizeUrl, exchangeCode, mintSession, randomId, readSession } from './auth.js'
+import { cleanName } from './names.js'
+import { verify } from './verify.js'
+
+const CORS = (origin, allowed) => ({
+  'access-control-allow-origin': allowed.includes(origin) ? origin : allowed[0],
+  'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+  'access-control-allow-headers': 'content-type,authorization',
+  'access-control-max-age': '86400',
+  vary: 'origin'
+})
+
+/**
+ * A redirect we are still allowed to add headers to.
+ *
+ * `Response.redirect()` returns a response whose headers are immutable, so the
+ * CORS pass afterwards throws and every sign-in turns into a 500.
+ */
+const redirect = (location) =>
+  new Response(null, { status: 302, headers: { location } })
+
+const json = (data, { status = 200, headers = {} } = {}) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', ...headers }
+  })
+
+const origins = (env) =>
+  (env.ALLOWED_ORIGINS ?? 'https://shutthecube.com')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+/** `<game>:<mode>:<period>`, and nothing that is not exactly that. */
+const boardKey = (game, mode, period) => {
+  const safe = /^[a-z0-9-]{1,32}$/
+  const stamp = /^(alltime|\d{4}-\d{2}-\d{2})$/
+  if (!safe.test(game) || !safe.test(mode) || !stamp.test(period)) return null
+  return `${game}:${mode}:${period}`
+}
+
+const now = () => Math.floor(Date.now() / 1000)
+
+const playerFrom = async (request, env) => {
+  const header = request.headers.get('authorization') ?? ''
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null
+  if (!token) return null
+  const id = await readSession(token, env.SESSION_SECRET)
+  if (!id) return null
+  return env.DB.prepare('SELECT id, name FROM players WHERE id = ?').bind(id).first()
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url)
+    const origin = request.headers.get('origin') ?? ''
+    const cors = CORS(origin, origins(env))
+
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors })
+
+    try {
+      const response = await route(request, env, url)
+      for (const [k, v] of Object.entries(cors)) response.headers.set(k, v)
+      return response
+    } catch (error) {
+      // Never hand an internal message to a caller; the game only needs to
+      // know the board is unavailable so it can hide it.
+      console.error('arcade-api', error?.stack ?? error)
+      return json({ error: 'unavailable' }, { status: 500, headers: cors })
+    }
+  }
+}
+
+async function route(request, env, url) {
+  const { pathname } = url
+  const method = request.method
+
+  // ---------------------------------------------------------------- board
+
+  if (method === 'GET' && pathname === '/v1/board') {
+    const board = boardKey(
+      url.searchParams.get('game') ?? '',
+      url.searchParams.get('mode') ?? '',
+      url.searchParams.get('period') ?? ''
+    )
+    if (!board) return json({ error: 'bad board' }, { status: 400 })
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') ?? 20)))
+
+    const { results } = await env.DB.prepare(
+      `SELECT p.name AS name, s.score, s.won, s.rolls, s.created_at
+         FROM scores s JOIN players p ON p.id = s.player_id
+        WHERE s.board = ?
+        ORDER BY s.score DESC, s.created_at ASC
+        LIMIT ?`
+    )
+      .bind(board, limit)
+      .all()
+
+    return json(
+      { board, entries: (results ?? []).map((r, i) => ({ rank: i + 1, ...r })) },
+      // A leaderboard may be a few seconds stale; it must not cost a query per
+      // viewer per refresh.
+      { headers: { 'cache-control': 'public, max-age=30' } }
+    )
+  }
+
+  // ---------------------------------------------------------------- score
+
+  if (method === 'POST' && pathname === '/v1/score') {
+    const player = await playerFrom(request, env)
+    if (!player) return json({ error: 'sign in first' }, { status: 401 })
+
+    const body = await request.json().catch(() => null)
+    if (!body) return json({ error: 'bad request' }, { status: 400 })
+
+    const { game, mode, period, seed, score, rolls, won, moves } = body
+    const board = boardKey(String(game ?? ''), String(mode ?? ''), String(period ?? ''))
+    if (!board) return json({ error: 'bad board' }, { status: 400 })
+    // Only a seeded game can be verified, so only a seeded game can be ranked.
+    if (!Number.isFinite(Number(seed))) {
+      return json({ error: 'unranked game' }, { status: 400 })
+    }
+
+    const checked = verify({
+      modeKey: String(mode),
+      seed: Number(seed),
+      score: Number(score),
+      rolls: Number(rolls),
+      won: Boolean(won),
+      moves
+    })
+    if (!checked.ok) {
+      console.warn('rejected score', board, player.id, checked.reason)
+      return json({ error: 'that score does not check out' }, { status: 422 })
+    }
+
+    // One entry per player per board, and only an improvement replaces it.
+    await env.DB.prepare(
+      `INSERT INTO scores (board, player_id, score, won, rolls, seed, proof, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(board, player_id) DO UPDATE SET
+         score = excluded.score, won = excluded.won, rolls = excluded.rolls,
+         proof = excluded.proof, created_at = excluded.created_at
+       WHERE excluded.score > scores.score`
+    )
+      .bind(
+        board,
+        player.id,
+        checked.score,
+        won ? 1 : 0,
+        Number(rolls) || 0,
+        Number(seed) >>> 0,
+        JSON.stringify(moves ?? []).slice(0, 4000),
+        now()
+      )
+      .run()
+
+    const rank = await env.DB.prepare(
+      `SELECT COUNT(*) + 1 AS rank FROM scores
+        WHERE board = ? AND score > (SELECT score FROM scores WHERE board = ? AND player_id = ?)`
+    )
+      .bind(board, board, player.id)
+      .first()
+
+    return json({ ok: true, rank: rank?.rank ?? null })
+  }
+
+  // ------------------------------------------------------------------- me
+
+  if (pathname === '/v1/me') {
+    const player = await playerFrom(request, env)
+    if (!player) return json({ error: 'sign in first' }, { status: 401 })
+
+    if (method === 'GET') return json({ id: player.id, name: player.name })
+
+    if (method === 'PATCH') {
+      const body = await request.json().catch(() => null)
+      const checked = cleanName(body?.name)
+      if (!checked.ok) return json({ error: checked.reason }, { status: 400 })
+      await env.DB.prepare('UPDATE players SET name = ?, updated_at = ? WHERE id = ?')
+        .bind(checked.name, now(), player.id)
+        .run()
+      return json({ ok: true, name: checked.name })
+    }
+
+    if (method === 'DELETE') {
+      // Everything, immediately, with no "are you sure" on the server side.
+      // The promise on the privacy page is only worth what this does.
+      await env.DB.batch([
+        env.DB.prepare('DELETE FROM scores WHERE player_id = ?').bind(player.id),
+        env.DB.prepare('DELETE FROM handoffs WHERE player_id = ?').bind(player.id),
+        env.DB.prepare('DELETE FROM players WHERE id = ?').bind(player.id)
+      ])
+      return json({ ok: true })
+    }
+  }
+
+  // ----------------------------------------------------------------- auth
+
+  if (method === 'GET' && pathname === '/v1/auth/start') {
+    const back = url.searchParams.get('redirect') ?? origins(env)[0]
+    if (!origins(env).some((o) => back.startsWith(o))) {
+      return json({ error: 'bad redirect' }, { status: 400 })
+    }
+    const state = randomId()
+    await env.DB.prepare('INSERT INTO auth_states (state, redirect, expires_at) VALUES (?, ?, ?)')
+      .bind(state, back, now() + 600)
+      .run()
+    return redirect(
+      authorizeUrl({
+        clientId: env.GOOGLE_CLIENT_ID,
+        redirectUri: `${url.origin}/v1/auth/callback`,
+        state
+      })
+    )
+  }
+
+  if (method === 'GET' && pathname === '/v1/auth/callback') {
+    const code = url.searchParams.get('code')
+    const state = url.searchParams.get('state')
+    if (!code || !state) return json({ error: 'bad callback' }, { status: 400 })
+
+    const row = await env.DB.prepare(
+      'SELECT redirect, expires_at FROM auth_states WHERE state = ?'
+    )
+      .bind(state)
+      .first()
+    await env.DB.prepare('DELETE FROM auth_states WHERE state = ?').bind(state).run()
+    if (!row || row.expires_at < now()) return json({ error: 'expired' }, { status: 400 })
+
+    const identity = await exchangeCode({
+      code,
+      clientId: env.GOOGLE_CLIENT_ID,
+      clientSecret: env.GOOGLE_CLIENT_SECRET,
+      redirectUri: `${url.origin}/v1/auth/callback`
+    })
+    if (!identity) return json({ error: 'sign in failed' }, { status: 400 })
+
+    let player = await env.DB.prepare('SELECT id FROM players WHERE sub = ?')
+      .bind(identity.sub)
+      .first()
+    if (!player) {
+      const suggested = cleanName(identity.name)
+      const id = randomId(12)
+      await env.DB.prepare(
+        'INSERT INTO players (id, sub, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
+      )
+        .bind(id, identity.sub, suggested.ok ? suggested.name : 'Player', now(), now())
+        .run()
+      player = { id }
+    }
+
+    // Hand back a one-time code rather than the session itself: a token in a
+    // redirect URL lands in browser history, and in any referrer that follows.
+    const handoff = randomId()
+    await env.DB.prepare('INSERT INTO handoffs (code, player_id, expires_at) VALUES (?, ?, ?)')
+      .bind(handoff, player.id, now() + 120)
+      .run()
+    return redirect(`${row.redirect}?auth=${handoff}`)
+  }
+
+  if (method === 'POST' && pathname === '/v1/auth/claim') {
+    const body = await request.json().catch(() => null)
+    const code = body?.code
+    if (typeof code !== 'string') return json({ error: 'bad request' }, { status: 400 })
+
+    const row = await env.DB.prepare(
+      'SELECT player_id, expires_at FROM handoffs WHERE code = ?'
+    )
+      .bind(code)
+      .first()
+    // One use only, whether or not it turns out to be valid.
+    await env.DB.prepare('DELETE FROM handoffs WHERE code = ?').bind(code).run()
+    if (!row || row.expires_at < now()) return json({ error: 'expired' }, { status: 400 })
+
+    const player = await env.DB.prepare('SELECT id, name FROM players WHERE id = ?')
+      .bind(row.player_id)
+      .first()
+    if (!player) return json({ error: 'expired' }, { status: 400 })
+
+    return json({
+      token: await mintSession(player.id, env.SESSION_SECRET),
+      name: player.name
+    })
+  }
+
+  return json({ error: 'not found' }, { status: 404 })
+}
