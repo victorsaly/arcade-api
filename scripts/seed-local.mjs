@@ -16,7 +16,7 @@ const NAMES = [
   "Sofia", "Idris", "Mei", "Ravi", "Freja", "Ollie", "Lili", "Bea",
 ];
 
-const BEATS = ["color", "sound", "time"];
+const BEATS = ["color", "sound", "time", "fever", "phantom", "offgrid"];
 const LEVELS = ["easy", "hard", "brutal"];
 const CUBE = ["beginner", "medium", "ninja"];
 const DAYS = ["2026-09-02", "2026-09-01", "2026-08-31", "2026-08-30"];
@@ -34,8 +34,11 @@ for (const game of BEATS) {
     for (const day of DAYS) {
       const cast = NAMES.map((_, i) => i).filter((i) => (i + day.length + level.length) % 3 !== 0);
       for (const i of cast.slice(0, 11)) {
-        const base = 260 + ((i * 37 + day.charCodeAt(9) * 13 + level.length * 29) % 230);
-        add(`beats:${game}-${level}:${day}`, i, Math.min(500, base));
+        /* Each game is out of a different number, so the mock scores have to
+           respect their own scale or the board lies about what it measures. */
+        const max = game === "fever" ? 800 : game === "phantom" ? 300 : 500;
+        const base = Math.round(max * (0.5 + ((i * 37 + day.charCodeAt(9) * 13 + level.length * 29) % 45) / 100));
+        add(`beats:${game}-${level}:${day}`, i, Math.min(max, base));
       }
     }
   }

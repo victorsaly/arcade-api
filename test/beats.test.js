@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { colorTargets, timeTargets, verifyBeats } from '../src/beats.js'
+import { colorTargets, offgridCulprits, timeTargets, verifyBeats } from '../src/beats.js'
 
 /**
  * The Worker's colour math must agree with the game's, exactly.
@@ -159,5 +159,69 @@ describe('the other ranked games', () => {
   it('still refuses a game with no checker', () => {
     expect(verifyBeats({ modeKey: 'tempo-hard', seed: 1, proof: { guesses: [1,2,3,4,5] } }).ok).toBe(false)
     expect(verifyBeats({ modeKey: 'offgrid-easy', seed: 1, proof: { guesses: [1,2,3,4,5] } }).ok).toBe(false)
+  })
+})
+
+/**
+ * The timing games score a run of errors rather than a run of answers, so they
+ * are checked by recomputing the same arithmetic on the same numbers — the
+ * standard the other games are held to, applied to a different shape of proof.
+ */
+describe('the timing games', () => {
+  it('scores Fever Dream from eight tap errors', () => {
+    const perfect = verifyBeats({ modeKey: 'fever-easy', seed: 1, proof: { errors: Array(8).fill(0) } })
+    expect(perfect.score).toBe(800) // ten a beat, in tenths
+    const missed = verifyBeats({ modeKey: 'fever-easy', seed: 1, proof: { errors: Array(8).fill(null) } })
+    expect(missed.score).toBe(0)
+  })
+
+  it('holds Fever Dream to its window, which tightens with difficulty', () => {
+    const at = (level) =>
+      verifyBeats({ modeKey: `fever-${level}`, seed: 1, proof: { errors: Array(8).fill(50) } }).score
+    // The same 50ms slip is worth less the tighter the window gets.
+    expect(at('easy')).toBeGreaterThan(at('hard'))
+    expect(at('hard')).toBeGreaterThan(at('brutal'))
+  })
+
+  it('scores Phantom Drop over three rounds', () => {
+    expect(verifyBeats({ modeKey: 'phantom-hard', seed: 1, proof: { errors: [0, 0, 0] } }).score).toBe(300)
+  })
+
+  it('rejects the wrong number of rounds', () => {
+    expect(verifyBeats({ modeKey: 'phantom-hard', seed: 1, proof: { errors: [0, 0] } }).ok).toBe(false)
+    expect(verifyBeats({ modeKey: 'fever-easy', seed: 1, proof: { errors: [0] } }).ok).toBe(false)
+  })
+
+  it('rejects an error nobody could have produced', () => {
+    expect(verifyBeats({ modeKey: 'fever-easy', seed: 1, proof: { errors: Array(8).fill(1e9) } }).ok).toBe(false)
+  })
+
+  it('scores Off-Grid against the culprits its seed chose', () => {
+    const seed = 12345
+    const culprits = offgridCulprits(seed)
+    const all = verifyBeats({ modeKey: 'offgrid-easy', seed, proof: { picks: culprits } })
+    expect(all.score).toBe(500) // five right, ten each, in tenths
+    // Next door is worth three; the wrong end of the bar is worth nothing.
+    const near = culprits.map((c) => (c + 1) % 8)
+    expect(verifyBeats({ modeKey: 'offgrid-easy', seed, proof: { picks: near } }).score).toBeLessThan(500)
+    expect(verifyBeats({ modeKey: 'offgrid-easy', seed, proof: { picks: [null, null, null, null, null] } }).score).toBe(0)
+  })
+
+  it('never puts the culprit on the anchor step, or twice running', () => {
+    for (let seed = 1; seed < 200; seed += 1) {
+      const c = offgridCulprits(seed)
+      expect(c.every((x) => x >= 1 && x < 8)).toBe(true)
+      for (let i = 1; i < c.length; i += 1) expect(c[i]).not.toBe(c[i - 1])
+    }
+  })
+
+  it('rejects a pick off the end of the bar', () => {
+    expect(verifyBeats({ modeKey: 'offgrid-easy', seed: 1, proof: { picks: [99, 1, 2, 3, 4] } }).ok).toBe(false)
+  })
+
+  it('still refuses the games that have no checker', () => {
+    for (const mode of ['tempo-hard', 'memory-easy', 'piano-hard']) {
+      expect(verifyBeats({ modeKey: mode, seed: 1, proof: { errors: [0] } }).ok).toBe(false)
+    }
   })
 })

@@ -96,6 +96,38 @@ export const timeTargets = (seed, level) => {
   return Array.from({ length: SLOTS }, () => Math.round((min + rng() * (max - min)) / 10) * 10)
 }
 
+/* ---------- Fever Dream: eight taps against a metronome ---------- */
+
+/* No seed: the pattern is a plain click at a fixed tempo, so the challenge is
+   the same for everyone by construction rather than by agreement. */
+const FEVER = { easy: 190, hard: 145, brutal: 105 }
+const FEVER_BEATS = 8
+const timingScore = (errorMs, windowMs) => Math.max(0, 10 * (1 - Math.abs(errorMs) / windowMs))
+
+/* ---------- Phantom Drop: three returning drops ---------- */
+
+const PHANTOM = { easy: 190, hard: 140, brutal: 100 }
+const PHANTOM_ROUNDS = 3
+
+/* ---------- Off-Grid: five late hits to find ---------- */
+
+const OFFGRID_ROUNDS = 5
+const OFFGRID_STEPS = 8
+
+/** Which step is nudged late each round. Never step 0, never twice running. */
+export const offgridCulprits = (seed) => {
+  const rng = mulberry32(seed >>> 0)
+  const out = []
+  let previous = -1
+  for (let r = 0; r < OFFGRID_ROUNDS; r += 1) {
+    let next = 1 + Math.floor(rng() * (OFFGRID_STEPS - 1))
+    if (next === previous) next = 1 + (next % (OFFGRID_STEPS - 1))
+    out.push(next)
+    previous = next
+  }
+  return out
+}
+
 /* ---------- what each game needs from a submission ---------- */
 
 /**
@@ -131,6 +163,58 @@ const GAMES = {
     // A held duration, in milliseconds. Nobody holds a button for a minute.
     valid: (g) => Number.isFinite(g) && g > 0 && g <= 60000,
     score: durationScore
+  },
+
+  /*
+   * The timing games score a run of errors rather than a run of answers, so
+   * they carry their own scorer instead of the targets/score pair above.
+   * `total` returns the score in tenths, or null if the proof is not usable.
+   */
+  fever: {
+    levels: ['easy', 'hard', 'brutal'],
+    total: (proof, level) => {
+      const errors = proof?.errors
+      const windowMs = FEVER[level]
+      if (!Array.isArray(errors) || errors.length !== FEVER_BEATS) return null
+      // A tap further out than the window scores nothing anyway; anything
+      // beyond a whole second never came from the game.
+      if (!errors.every((e) => e === null || (Number.isFinite(e) && Math.abs(e) <= 4000))) return null
+      return Math.round(
+        errors.reduce((sum, e) => sum + (e === null ? 0 : timingScore(e, windowMs)), 0) * 10
+      )
+    }
+  },
+
+  phantom: {
+    levels: ['easy', 'hard', 'brutal'],
+    total: (proof, level) => {
+      const errors = proof?.errors
+      const windowMs = PHANTOM[level]
+      if (!Array.isArray(errors) || errors.length !== PHANTOM_ROUNDS) return null
+      if (!errors.every((e) => e === null || (Number.isFinite(e) && Math.abs(e) <= 8000))) return null
+      return Math.round(
+        errors.reduce((sum, e) => sum + (e === null ? 0 : timingScore(e, windowMs)), 0) * 10
+      )
+    }
+  },
+
+  offgrid: {
+    levels: ['easy', 'hard', 'brutal'],
+    total: (proof, level, seed) => {
+      const picks = proof?.picks
+      if (!Array.isArray(picks) || picks.length !== OFFGRID_ROUNDS) return null
+      if (!picks.every((p) => p === null || (Number.isInteger(p) && p >= 0 && p < OFFGRID_STEPS))) {
+        return null
+      }
+      const culprits = offgridCulprits(seed)
+      // Exactly right is ten; next door is three; anything else is nothing.
+      const total = picks.reduce((sum, pick, i) => {
+        if (pick === null) return sum
+        if (pick === culprits[i]) return sum + 10
+        return sum + (Math.abs(pick - culprits[i]) === 1 ? 3 : 0)
+      }, 0)
+      return Math.round(total * 10)
+    }
   }
 }
 
@@ -148,18 +232,24 @@ export const verifyBeats = ({ modeKey, seed, score: claimed, proof }) => {
   if (!spec || !spec.levels.includes(level)) return fail('unknown beats mode')
   if (!Number.isFinite(Number(seed))) return fail('no seed')
 
-  const guesses = proof?.guesses
-  if (!Array.isArray(guesses) || guesses.length !== SLOTS) {
-    return fail('a run is exactly five answers')
+  let tenths
+  if (spec.total) {
+    // A timing game: the proof is the run of errors or picks it produced.
+    tenths = spec.total(proof, level, Number(seed))
+    if (tenths === null) return fail('that run cannot be scored')
+  } else {
+    const guesses = proof?.guesses
+    if (!Array.isArray(guesses) || guesses.length !== SLOTS) {
+      return fail('a run is exactly five answers')
+    }
+    if (!guesses.every((g) => spec.valid(g))) return fail('an answer outside the controls')
+
+    const targets = spec.targets(Number(seed), level)
+    if (!targets) return fail('cannot rebuild that challenge')
+
+    // The same rounding the game shows the player.
+    tenths = Math.round(targets.reduce((sum, t, i) => sum + spec.score(t, guesses[i]), 0) * 10)
   }
-  if (!guesses.every((g) => spec.valid(g))) return fail('an answer outside the controls')
-
-  const targets = spec.targets(Number(seed), level)
-  if (!targets) return fail('cannot rebuild that challenge')
-
-  const total = targets.reduce((sum, t, i) => sum + spec.score(t, guesses[i]), 0)
-  // The same rounding the game shows the player.
-  const tenths = Math.round(total * 10)
 
   if (claimed !== undefined && Number(claimed) !== tenths) {
     return fail(`claimed ${claimed} but played ${tenths}`)
