@@ -102,16 +102,47 @@ async function route(request, env, url) {
     )
     if (!board) return json({ error: 'bad board' }, { status: 400 })
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit') ?? 20)))
+    const game = url.searchParams.get('game')
+    const mode = url.searchParams.get('mode')
 
-    const { results } = await env.DB.prepare(
-      `SELECT p.name AS name, s.score, s.won, s.rolls, s.created_at
-         FROM scores s JOIN players p ON p.id = s.player_id
-        WHERE s.board = ?
-        ORDER BY s.score DESC, s.created_at ASC
-        LIMIT ?`
-    )
-      .bind(board, limit)
-      .all()
+    /*
+     * All-time totals every daily a player has finished in this mode.
+     *
+     * Ranking by best-ever score would saturate: Medium tops out at 405 and
+     * shutting the box is achievable, so the head of the table becomes a pile
+     * of ties. A running total does not tie, and it rewards turning up, which
+     * is what the daily is for.
+     *
+     * The prefix is matched as a range rather than with LIKE so the
+     * (board, score) index can serve it.
+     */
+    const alltime = url.searchParams.get('period') === 'alltime'
+    const prefix = `${game}:${mode}:`
+    const { results } = alltime
+      ? await env.DB.prepare(
+          `SELECT p.name AS name,
+                  SUM(s.score) AS score,
+                  COUNT(*)     AS days,
+                  SUM(s.won)   AS shut,
+                  MAX(s.score) AS best,
+                  MIN(s.created_at) AS created_at
+             FROM scores s JOIN players p ON p.id = s.player_id
+            WHERE s.board >= ? AND s.board < ?
+            GROUP BY s.player_id
+            ORDER BY score DESC, days ASC
+            LIMIT ?`
+        )
+          .bind(prefix, `${prefix}￿`, limit)
+          .all()
+      : await env.DB.prepare(
+          `SELECT p.name AS name, s.score, s.won, s.rolls, s.created_at
+             FROM scores s JOIN players p ON p.id = s.player_id
+            WHERE s.board = ?
+            ORDER BY s.score DESC, s.created_at ASC
+            LIMIT ?`
+        )
+          .bind(board, limit)
+          .all()
 
     return json(
       { board, entries: (results ?? []).map((r, i) => ({ rank: i + 1, ...r })) },
@@ -130,7 +161,7 @@ async function route(request, env, url) {
     const body = await request.json().catch(() => null)
     if (!body) return json({ error: 'bad request' }, { status: 400 })
 
-    const { game, mode, period, seed, score, rolls, won, moves } = body
+    const { game, mode, period, seed, score, won, turns } = body
     const board = boardKey(String(game ?? ''), String(mode ?? ''), String(period ?? ''))
     if (!board) return json({ error: 'bad board' }, { status: 400 })
     // Only a seeded game can be verified, so only a seeded game can be ranked.
@@ -138,13 +169,14 @@ async function route(request, env, url) {
       return json({ error: 'unranked game' }, { status: 400 })
     }
 
+    // The score is replayed, not believed: `verify` works it out from the
+    // turns and only compares the claim against its own answer.
     const checked = verify({
       modeKey: String(mode),
       seed: Number(seed),
       score: Number(score),
-      rolls: Number(rolls),
       won: Boolean(won),
-      moves
+      turns
     })
     if (!checked.ok) {
       console.warn('rejected score', board, player.id, checked.reason)
@@ -164,10 +196,10 @@ async function route(request, env, url) {
         board,
         player.id,
         checked.score,
-        won ? 1 : 0,
-        Number(rolls) || 0,
+        checked.won ? 1 : 0,
+        checked.rolls,
         Number(seed) >>> 0,
-        JSON.stringify(moves ?? []).slice(0, 4000),
+        JSON.stringify(turns ?? []).slice(0, 20000),
         now()
       )
       .run()
