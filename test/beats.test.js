@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { colorTargets, verifyBeats } from '../src/beats.js'
+import { colorTargets, timeTargets, verifyBeats } from '../src/beats.js'
 
 /**
  * The Worker's colour math must agree with the game's, exactly.
@@ -97,5 +97,67 @@ describe('refusing a forged run', () => {
 
   it('rejects a game with no checker', () => {
     expect(verifyBeats({ modeKey: 'tempo-hard', seed: 1, proof: {} }).ok).toBe(false)
+  })
+})
+
+/**
+ * Sine Language and Second Sense, against fixtures dealt and scored with the
+ * games' own arithmetic.
+ *
+ * Second Sense is the one that matters most here: its difficulty changes the
+ * range the durations are drawn from, so it changes the challenge itself
+ * rather than only the time you get. Getting that wrong would reject every
+ * honest score on two of its three boards.
+ */
+const more = JSON.parse(readFileSync(new URL('./beats-more.json', import.meta.url)))
+
+describe('the other ranked games', () => {
+  for (const run of more) {
+    it(`agrees on ${run.game}-${run.level} ${run.st} (${run.label}, ${run.tenths})`, () => {
+      const r = verifyBeats({
+        modeKey: `${run.game}-${run.level}`,
+        seed: run.seed,
+        score: run.tenths,
+        proof: { guesses: run.guesses }
+      })
+      expect(r.reason ?? 'ok').toBe('ok')
+      expect(r.score).toBe(run.tenths)
+    })
+  }
+
+  it('rebuilds Second Sense differently at each difficulty', () => {
+    // Not via the score: a wildly wrong guess scores near zero at every range
+    // and rounds to the same number. The targets themselves are the claim.
+    const seed = more.find((r) => r.game === 'time').seed
+    const easy = timeTargets(seed, 'easy')
+    const brutal = timeTargets(seed, 'brutal')
+    expect(easy).not.toEqual(brutal)
+    // Easy stays inside 1500-4000ms; brutal reaches further in both directions.
+    expect(Math.min(...easy)).toBeGreaterThanOrEqual(1500)
+    expect(Math.max(...easy)).toBeLessThanOrEqual(4000)
+    expect(Math.max(...brutal)).toBeGreaterThan(4000)
+  })
+
+  it('refuses a difficulty it cannot rebuild', () => {
+    expect(timeTargets(1, 'impossible')).toBe(null)
+  })
+
+  it('rejects a pitch outside the slider', () => {
+    const run = more.find((r) => r.game === 'sound')
+    const bad = [...run.guesses]
+    bad[0] = 20000
+    expect(verifyBeats({ modeKey: 'sound-hard', seed: run.seed, proof: { guesses: bad } }).ok).toBe(false)
+  })
+
+  it('rejects an inflated pitch score', () => {
+    const run = more.find((r) => r.game === 'sound')
+    expect(
+      verifyBeats({ modeKey: 'sound-hard', seed: run.seed, score: 500, proof: { guesses: run.guesses } }).ok
+    ).toBe(false)
+  })
+
+  it('still refuses a game with no checker', () => {
+    expect(verifyBeats({ modeKey: 'tempo-hard', seed: 1, proof: { guesses: [1,2,3,4,5] } }).ok).toBe(false)
+    expect(verifyBeats({ modeKey: 'offgrid-easy', seed: 1, proof: { guesses: [1,2,3,4,5] } }).ok).toBe(false)
   })
 })

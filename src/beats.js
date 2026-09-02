@@ -64,9 +64,75 @@ export const colorTargets = (seed) => {
 
 const fail = (reason) => ({ ok: false, reason })
 
-/** Modes this can currently check. Difficulty changes the reveal time, never
- *  the challenge, so every difficulty shares the generator. */
-const COLOR_MODES = new Set(['color-easy', 'color-hard', 'color-brutal'])
+/* ---------- Sine Language: five pitches ---------- */
+
+const F_LO = 110
+const OCTAVES = 3
+const posToFreq = (p) => F_LO * Math.pow(2, (p / 1000) * OCTAVES)
+const cents = (a, b) => Math.abs(1200 * Math.log2(a / b))
+const pitchScore = (t, g) => Math.max(0, 10 * (1 - cents(t, g) / 300))
+
+export const soundTargets = (seed) => {
+  const rng = mulberry32(seed >>> 0)
+  return Array.from({ length: SLOTS }, () => posToFreq(40 + rng() * 920))
+}
+
+/* ---------- Second Sense: five durations ---------- */
+
+/** Difficulty changes the range here, so it changes the challenge itself. */
+const TIME_RANGES = {
+  easy: [1500, 4000],
+  hard: [1000, 7000],
+  brutal: [700, 10000]
+}
+const durationScore = (target, guess) =>
+  10 * Math.exp((-3.5 * Math.abs(guess - target)) / target)
+
+export const timeTargets = (seed, level) => {
+  const range = TIME_RANGES[level]
+  if (!range) return null
+  const [min, max] = range
+  const rng = mulberry32(seed >>> 0)
+  return Array.from({ length: SLOTS }, () => Math.round((min + rng() * (max - min)) / 10) * 10)
+}
+
+/* ---------- what each game needs from a submission ---------- */
+
+/**
+ * Each entry rebuilds the challenge and scores the player's five answers.
+ *
+ * `sameChallenge` records whether difficulty changes what you face or only how
+ * long you get: Afterimage and Sine Language deal the same targets at every
+ * level, Second Sense does not.
+ */
+const GAMES = {
+  color: {
+    levels: ['easy', 'hard', 'brutal'],
+    sameChallenge: true,
+    targets: (seed) => colorTargets(seed),
+    valid: (g) =>
+      Number.isFinite(g?.h) && g.h >= 0 && g.h <= 360 &&
+      Number.isFinite(g?.s) && g.s >= 0 && g.s <= 100 &&
+      Number.isFinite(g?.l) && g.l >= 0 && g.l <= 100,
+    score: scoreOf
+  },
+  sound: {
+    levels: ['easy', 'hard', 'brutal'],
+    sameChallenge: true,
+    targets: (seed) => soundTargets(seed),
+    // The slider spans 110–880 Hz; a guess outside it never came from the game.
+    valid: (g) => Number.isFinite(g) && g >= F_LO && g <= F_LO * 2 ** OCTAVES,
+    score: pitchScore
+  },
+  time: {
+    levels: ['easy', 'hard', 'brutal'],
+    sameChallenge: false,
+    targets: (seed, level) => timeTargets(seed, level),
+    // A held duration, in milliseconds. Nobody holds a button for a minute.
+    valid: (g) => Number.isFinite(g) && g > 0 && g <= 60000,
+    score: durationScore
+  }
+}
 
 /**
  * Rebuild the challenge, score the player's inputs, compare with the claim.
@@ -75,23 +141,23 @@ const COLOR_MODES = new Set(['color-easy', 'color-hard', 'color-brutal'])
  * and the scores table thinks in integers, so 42.1 travels as 421.
  */
 export const verifyBeats = ({ modeKey, seed, score: claimed, proof }) => {
-  if (!COLOR_MODES.has(modeKey)) return fail('unknown beats mode')
+  const split = String(modeKey).lastIndexOf('-')
+  const game = split > 0 ? String(modeKey).slice(0, split) : ''
+  const level = split > 0 ? String(modeKey).slice(split + 1) : ''
+  const spec = GAMES[game]
+  if (!spec || !spec.levels.includes(level)) return fail('unknown beats mode')
   if (!Number.isFinite(Number(seed))) return fail('no seed')
 
   const guesses = proof?.guesses
   if (!Array.isArray(guesses) || guesses.length !== SLOTS) {
-    return fail('a run is exactly five colours')
+    return fail('a run is exactly five answers')
   }
-  for (const g of guesses) {
-    const { h, s, l } = g ?? {}
-    // The sliders' own ranges; anything outside them never came from the game.
-    if (!Number.isFinite(h) || h < 0 || h > 360) return fail('impossible hue')
-    if (!Number.isFinite(s) || s < 0 || s > 100) return fail('impossible saturation')
-    if (!Number.isFinite(l) || l < 0 || l > 100) return fail('impossible lightness')
-  }
+  if (!guesses.every((g) => spec.valid(g))) return fail('an answer outside the controls')
 
-  const targets = colorTargets(Number(seed))
-  const total = targets.reduce((sum, t, i) => sum + scoreOf(t, guesses[i]), 0)
+  const targets = spec.targets(Number(seed), level)
+  if (!targets) return fail('cannot rebuild that challenge')
+
+  const total = targets.reduce((sum, t, i) => sum + spec.score(t, guesses[i]), 0)
   // The same rounding the game shows the player.
   const tenths = Math.round(total * 10)
 
