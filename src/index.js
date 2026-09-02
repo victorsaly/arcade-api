@@ -18,6 +18,7 @@
 import { authorizeUrl, exchangeCode, mintSession, randomId, readSession } from './auth.js'
 import { cleanName } from './names.js'
 import { verify } from './verify.js'
+import { verifyBeats } from './beats.js'
 
 const CORS = (origin, allowed) => ({
   'access-control-allow-origin': allowed.includes(origin) ? origin : allowed[0],
@@ -161,7 +162,7 @@ async function route(request, env, url) {
     const body = await request.json().catch(() => null)
     if (!body) return json({ error: 'bad request' }, { status: 400 })
 
-    const { game, mode, period, seed, score, won, turns } = body
+    const { game, mode, period, seed, score, won, turns, proof } = body
     const board = boardKey(String(game ?? ''), String(mode ?? ''), String(period ?? ''))
     if (!board) return json({ error: 'bad board' }, { status: 400 })
     // Only a seeded game can be verified, so only a seeded game can be ranked.
@@ -169,15 +170,32 @@ async function route(request, env, url) {
       return json({ error: 'unranked game' }, { status: 400 })
     }
 
-    // The score is replayed, not believed: `verify` works it out from the
-    // turns and only compares the claim against its own answer.
-    const checked = verify({
-      modeKey: String(mode),
-      seed: Number(seed),
-      score: Number(score),
-      won: Boolean(won),
-      turns
-    })
+    /*
+     * The score is replayed, not believed: each game's checker rebuilds the
+     * challenge from the seed and works the score out for itself, comparing
+     * the claim only against its own answer.
+     *
+     * A game with no checker cannot be ranked. That is the rule that keeps
+     * this honest as more games arrive: adding a board is adding a way to
+     * verify it, not just a new key prefix.
+     */
+    const checked =
+      game === 'shutthecube'
+        ? verify({
+            modeKey: String(mode),
+            seed: Number(seed),
+            score: Number(score),
+            won: Boolean(won),
+            turns
+          })
+        : game === 'beats'
+          ? verifyBeats({
+              modeKey: String(mode),
+              seed: Number(seed),
+              score: Number(score),
+              proof
+            })
+          : { ok: false, reason: 'no checker for that game' }
     if (!checked.ok) {
       console.warn('rejected score', board, player.id, checked.reason)
       return json({ error: 'that score does not check out' }, { status: 422 })
@@ -199,7 +217,7 @@ async function route(request, env, url) {
         checked.won ? 1 : 0,
         checked.rolls,
         Number(seed) >>> 0,
-        JSON.stringify(turns ?? []).slice(0, 20000),
+        JSON.stringify(turns ?? proof ?? []).slice(0, 20000),
         now()
       )
       .run()
