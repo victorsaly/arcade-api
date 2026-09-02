@@ -16,8 +16,10 @@ const NAMES = [
   "Sofia", "Idris", "Mei", "Ravi", "Freja", "Ollie", "Lili", "Bea",
 ];
 
-const BEATS = ["color", "sound", "time", "fever", "phantom", "offgrid"];
+const BEATS = ["color", "sound", "time", "fever", "phantom", "offgrid", "memory", "piano", "tempo"];
 const LEVELS = ["easy", "hard", "brutal"];
+/* Downbeat alone has a fourth. */
+const LEVELS_FOR = (g) => (g === "tempo" ? [...LEVELS, "medium"] : LEVELS);
 const CUBE = ["beginner", "medium", "ninja"];
 const DAYS = ["2026-09-02", "2026-09-01", "2026-08-31", "2026-08-30"];
 
@@ -30,13 +32,18 @@ const add = (board, i, score, won = 0, rolls = 5) =>
 
 /* Beats: tenths, out of 500. */
 for (const game of BEATS) {
-  for (const level of LEVELS) {
+  for (const level of LEVELS_FOR(game)) {
     for (const day of DAYS) {
       const cast = NAMES.map((_, i) => i).filter((i) => (i + day.length + level.length) % 3 !== 0);
       for (const i of cast.slice(0, 11)) {
         /* Each game is out of a different number, so the mock scores have to
            respect their own scale or the board lies about what it measures. */
-        const max = game === "fever" ? 800 : game === "phantom" ? 300 : 500;
+        /* Levels-cleared games count in whole levels; Downbeat is a percentage. */
+        const max =
+          game === "fever" ? 800 :
+          game === "phantom" ? 300 :
+          game === "tempo" ? 1000 :
+          game === "memory" || game === "piano" ? 180 : 500;
         const base = Math.round(max * (0.5 + ((i * 37 + day.charCodeAt(9) * 13 + level.length * 29) % 45) / 100));
         add(`beats:${game}-${level}:${day}`, i, Math.min(max, base));
       }

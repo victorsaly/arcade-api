@@ -14,6 +14,7 @@
  */
 
 import { mulberry32 } from './random.js'
+import { downbeatNotes, downbeatScore, echoScore, refrainScore } from './challenges.mjs'
 
 const SLOTS = 5
 
@@ -196,6 +197,41 @@ const GAMES = {
         errors.reduce((sum, e) => sum + (e === null ? 0 : timingScore(e, windowMs)), 0) * 10
       )
     }
+  },
+
+  /*
+   * The progression games are replayed rather than rescored: the proof is
+   * every tap of every level, and the shared challenge module walks the run
+   * forward exactly as the game did, dealing each level from the seed and
+   * spending a life when a level is missed. The answer is levels cleared, so
+   * these boards count levels, not points.
+   */
+  memory: {
+    levels: ['easy', 'hard', 'brutal'],
+    counts: 'levels',
+    total: (proof, level, seed) => {
+      const cleared = echoScore(seed, level, proof?.taps)
+      return cleared === null ? null : cleared * 10
+    }
+  },
+
+  piano: {
+    levels: ['easy', 'hard', 'brutal'],
+    counts: 'levels',
+    total: (proof, level, seed) => {
+      const cleared = refrainScore(seed, level, proof?.taps)
+      return cleared === null ? null : cleared * 10
+    }
+  },
+
+  /*
+   * Downbeat's timeline is fixed by its patterns — only the tempo comes from
+   * the seed, and tempo does not change what is worth what. So the run is
+   * scored from its own tallies, against a note count the server derives.
+   */
+  tempo: {
+    levels: ['easy', 'medium', 'hard', 'brutal'],
+    total: (proof, level) => downbeatScore(level, proof?.counts)
   },
 
   offgrid: {
