@@ -6,6 +6,13 @@ compatibility_date = "2026-05-03"
 # every request is cross-origin by design; this is the allowlist for it.
 [vars]
 ALLOWED_ORIGINS = "https://shutthecube.com,https://delulubeats.com,https://victorsaly.com,http://localhost:3000,http://localhost:3100,http://localhost:4173,http://localhost:5173"
+# The installed apps (Capacitor). They may call the API from the wrapper's
+# origin, and a sign-in started in one is returned to the app's own address.
+APP_ORIGINS = "capacitor://localhost,https://localhost"
+APP_REDIRECTS = "com.victorsaly.shutthecube://auth"
+# Bundle ids whose Sign in with Apple tokens are accepted. Empty until the
+# app has the capability; with none listed the endpoint answers 404.
+APPLE_AUDIENCES = ""
 # Public by design — it travels in the redirect URL of every sign-in. The
 # matching secret is set with `wrangler secret put` and lives only at Cloudflare.
 GOOGLE_CLIENT_ID = "840152737364-1itggkdlsvd8gq3tc5t0p53ev6iuoqrt.apps.googleusercontent.com"

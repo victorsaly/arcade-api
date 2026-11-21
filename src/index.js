@@ -10,12 +10,15 @@
  *   GET  /v1/auth/start               begin the Google redirect
  *   GET  /v1/auth/callback            Google returns here
  *   POST /v1/auth/claim               trade the one-time code for a session
+ *   POST /v1/auth/apple               sign in with an Apple identity token
  *
  * The games stay entirely playable when this is unreachable. Nothing here is
  * on the critical path of a game of dice.
  */
 
 import { authorizeUrl, exchangeCode, mintSession, randomId, readSession } from './auth.js'
+import { verifyAppleIdentity } from './apple.js'
+import { allowedRedirect, listOf, withCode } from './redirects.js'
 import { cleanName } from './names.js'
 import { verify } from './verify.js'
 import { verifyBeats } from './beats.js'
@@ -43,11 +46,16 @@ const json = (data, { status = 200, headers = {} } = {}) =>
     headers: { 'content-type': 'application/json; charset=utf-8', ...headers }
   })
 
-const origins = (env) =>
-  (env.ALLOWED_ORIGINS ?? 'https://shutthecube.com')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
+const origins = (env) => listOf(env.ALLOWED_ORIGINS ?? 'https://shutthecube.com')
+
+/*
+ * The installed apps. Their pages are served from inside the app, so their
+ * origin is the wrapper's (`capacitor://localhost` on iOS, `https://localhost`
+ * on Android) and they may call the API; but neither is a place a sign-in may
+ * be sent back to. An app is returned to through its own address instead.
+ */
+const appOrigins = (env) => listOf(env.APP_ORIGINS)
+const appRedirects = (env) => listOf(env.APP_REDIRECTS)
 
 /** `<game>:<mode>:<period>`, and nothing that is not exactly that. */
 const boardKey = (game, mode, period) => {
@@ -72,7 +80,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url)
     const origin = request.headers.get('origin') ?? ''
-    const cors = CORS(origin, origins(env))
+    const cors = CORS(origin, [...origins(env), ...appOrigins(env)])
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors })
 
@@ -266,7 +274,7 @@ async function route(request, env, url) {
 
   if (method === 'GET' && pathname === '/v1/auth/start') {
     const back = url.searchParams.get('redirect') ?? origins(env)[0]
-    if (!origins(env).some((o) => back.startsWith(o))) {
+    if (!allowedRedirect(back, { origins: origins(env), appRedirects: appRedirects(env) })) {
       return json({ error: 'bad redirect' }, { status: 400 })
     }
     const state = randomId()
@@ -303,19 +311,7 @@ async function route(request, env, url) {
     })
     if (!identity) return json({ error: 'sign in failed' }, { status: 400 })
 
-    let player = await env.DB.prepare('SELECT id FROM players WHERE sub = ?')
-      .bind(identity.sub)
-      .first()
-    if (!player) {
-      const suggested = cleanName(identity.name)
-      const id = randomId(12)
-      await env.DB.prepare(
-        'INSERT INTO players (id, sub, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
-      )
-        .bind(id, identity.sub, suggested.ok ? suggested.name : 'Player', now(), now())
-        .run()
-      player = { id }
-    }
+    const player = await playerFor(env, identity)
 
     // Hand back a one-time code rather than the session itself: a token in a
     // redirect URL lands in browser history, and in any referrer that follows.
@@ -323,7 +319,7 @@ async function route(request, env, url) {
     await env.DB.prepare('INSERT INTO handoffs (code, player_id, expires_at) VALUES (?, ?, ?)')
       .bind(handoff, player.id, now() + 120)
       .run()
-    return redirect(`${row.redirect}?auth=${handoff}`)
+    return redirect(withCode(row.redirect, handoff))
   }
 
   if (method === 'POST' && pathname === '/v1/auth/claim') {
@@ -351,5 +347,39 @@ async function route(request, env, url) {
     })
   }
 
+  if (method === 'POST' && pathname === '/v1/auth/apple') {
+    const audiences = listOf(env.APPLE_AUDIENCES)
+    // Not configured means not offered, rather than a sign-in that can never work.
+    if (audiences.length === 0) return json({ error: 'not found' }, { status: 404 })
+
+    const body = await request.json().catch(() => null)
+    const identity = await verifyAppleIdentity(body?.identityToken, { audiences })
+    if (!identity) return json({ error: 'sign in failed' }, { status: 400 })
+
+    // Apple gives the name to the device once, on the first sign-in, and never
+    // to us; the app passes it along and it is only ever a suggestion.
+    const player = await playerFor(env, { ...identity, name: body?.name })
+    const row = await env.DB.prepare('SELECT id, name FROM players WHERE id = ?')
+      .bind(player.id)
+      .first()
+    return json({ token: await mintSession(row.id, env.SESSION_SECRET), name: row.name })
+  }
+
   return json({ error: 'not found' }, { status: 404 })
+}
+
+/** The player behind an identity, created on their first sign-in. */
+async function playerFor(env, identity) {
+  const existing = await env.DB.prepare('SELECT id FROM players WHERE sub = ?')
+    .bind(identity.sub)
+    .first()
+  if (existing) return existing
+  const suggested = cleanName(identity.name ?? '')
+  const id = randomId(12)
+  await env.DB.prepare(
+    'INSERT INTO players (id, sub, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)'
+  )
+    .bind(id, identity.sub, suggested.ok ? suggested.name : 'Player', now(), now())
+    .run()
+  return { id }
 }
