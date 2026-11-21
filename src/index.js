@@ -17,7 +17,7 @@
  */
 
 import { authorizeUrl, exchangeCode, mintSession, randomId, readSession } from './auth.js'
-import { verifyAppleIdentity } from './apple.js'
+import { appleKeyFrom, appleRefreshToken, revokeApple, verifyAppleIdentity } from './apple.js'
 import { allowedRedirect, listOf, withCode } from './redirects.js'
 import { cleanName } from './names.js'
 import { verify } from './verify.js'
@@ -73,7 +73,9 @@ const playerFrom = async (request, env) => {
   if (!token) return null
   const id = await readSession(token, env.SESSION_SECRET)
   if (!id) return null
-  return env.DB.prepare('SELECT id, name FROM players WHERE id = ?').bind(id).first()
+  return env.DB.prepare('SELECT id, name, sub, apple_refresh FROM players WHERE id = ?')
+    .bind(id)
+    .first()
 }
 
 export default {
@@ -261,6 +263,17 @@ async function route(request, env, url) {
     if (method === 'DELETE') {
       // Everything, immediately, with no "are you sure" on the server side.
       // The promise on the privacy page is only worth what this does.
+      // A player who came in through Apple is also signed out of the app at
+      // Apple's end, as Apple requires. The erasure below does not wait on
+      // it: if Apple cannot be reached, the data here still goes.
+      const key = appleKeyFrom(env)
+      if (key && player.apple_refresh) {
+        await revokeApple({
+          refreshToken: player.apple_refresh,
+          clientId: listOf(env.APPLE_AUDIENCES)[0],
+          key
+        })
+      }
       await env.DB.batch([
         env.DB.prepare('DELETE FROM scores WHERE player_id = ?').bind(player.id),
         env.DB.prepare('DELETE FROM handoffs WHERE player_id = ?').bind(player.id),
@@ -359,6 +372,22 @@ async function route(request, env, url) {
     // Apple gives the name to the device once, on the first sign-in, and never
     // to us; the app passes it along and it is only ever a suggestion.
     const player = await playerFor(env, { ...identity, name: body?.name })
+
+    // The code that came with the sign-in buys the one token kept for this
+    // player, so that deleting the account can revoke it at Apple too.
+    const key = appleKeyFrom(env)
+    if (key && typeof body?.authorizationCode === 'string') {
+      const refresh = await appleRefreshToken({
+        code: body.authorizationCode,
+        clientId: identity.aud,
+        key
+      })
+      if (refresh) {
+        await env.DB.prepare('UPDATE players SET apple_refresh = ? WHERE id = ?')
+          .bind(refresh, player.id)
+          .run()
+      }
+    }
     const row = await env.DB.prepare('SELECT id, name FROM players WHERE id = ?')
       .bind(player.id)
       .first()

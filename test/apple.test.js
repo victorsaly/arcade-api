@@ -1,5 +1,10 @@
 import { beforeAll, describe, expect, it } from 'vitest'
-import { verifyAppleIdentity } from '../src/apple.js'
+import {
+  appleClientSecret,
+  appleRefreshToken,
+  revokeApple,
+  verifyAppleIdentity
+} from '../src/apple.js'
 
 /**
  * Apple's side is played by a key pair made here: the public half is served
@@ -36,7 +41,7 @@ beforeAll(async () => {
 
 describe('an Apple identity token', () => {
   it('is accepted when Apple signed it for this app', async () => {
-    expect(await check(await tokenFor(good))).toEqual({ sub: 'apple:001234.abc' })
+    expect(await check(await tokenFor(good))).toEqual({ sub: 'apple:001234.abc', aud: AUD })
   })
 
   it('is refused when it was issued to another app', async () => {
@@ -75,5 +80,82 @@ describe('an Apple identity token', () => {
   it('is refused when it is not a token at all', async () => {
     expect(await check('nope')).toBeNull()
     expect(await check(undefined)).toBeNull()
+  })
+})
+
+describe('revoking an Apple sign-in', () => {
+  let key
+  let publicKey
+
+  beforeAll(async () => {
+    const ec = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, [
+      'sign',
+      'verify'
+    ])
+    publicKey = ec.publicKey
+    const der = Buffer.from(await crypto.subtle.exportKey('pkcs8', ec.privateKey)).toString('base64')
+    key = {
+      teamId: 'TEAM123456',
+      keyId: 'KEY1234567',
+      privateKey: `-----BEGIN PRIVATE KEY-----\n${der.match(/.{1,64}/g).join('\n')}\n-----END PRIVATE KEY-----`
+    }
+  })
+
+  const fromB64url = (text) => Buffer.from(text.replace(/-/g, '+').replace(/_/g, '/'), 'base64')
+
+  it('signs a short-lived request in the team\'s name', async () => {
+    const secret = await appleClientSecret({ ...key, clientId: AUD }, NOW)
+    const [h, c, s] = secret.split('.')
+    expect(JSON.parse(fromB64url(h))).toEqual({ alg: 'ES256', kid: 'KEY1234567' })
+    expect(JSON.parse(fromB64url(c))).toEqual({
+      iss: 'TEAM123456',
+      iat: NOW,
+      exp: NOW + 300,
+      aud: 'https://appleid.apple.com',
+      sub: AUD
+    })
+    const ok = await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      publicKey,
+      fromB64url(s),
+      new TextEncoder().encode(`${h}.${c}`)
+    )
+    expect(ok).toBe(true)
+  })
+
+  it('trades a sign-in code for the token it will later revoke', async () => {
+    const calls = []
+    const fetcher = async (url, init) => {
+      calls.push({ url, body: Object.fromEntries(init.body) })
+      return { ok: true, json: async () => ({ refresh_token: 'r-token' }) }
+    }
+    expect(await appleRefreshToken({ code: 'c0de', clientId: AUD, key, fetcher })).toBe('r-token')
+    expect(calls[0].url).toBe('https://appleid.apple.com/auth/token')
+    expect(calls[0].body).toMatchObject({ client_id: AUD, code: 'c0de', grant_type: 'authorization_code' })
+  })
+
+  it('returns nothing when Apple declines the code or cannot be reached', async () => {
+    const declined = async () => ({ ok: false, json: async () => ({}) })
+    const down = async () => {
+      throw new Error('offline')
+    }
+    expect(await appleRefreshToken({ code: 'x', clientId: AUD, key, fetcher: declined })).toBeNull()
+    expect(await appleRefreshToken({ code: 'x', clientId: AUD, key, fetcher: down })).toBeNull()
+  })
+
+  it('revokes with the stored token, and reports whether it took', async () => {
+    const calls = []
+    const fetcher = async (url, init) => {
+      calls.push({ url, body: Object.fromEntries(init.body) })
+      return { ok: true }
+    }
+    expect(await revokeApple({ refreshToken: 'r-token', clientId: AUD, key, fetcher })).toBe(true)
+    expect(calls[0].url).toBe('https://appleid.apple.com/auth/revoke')
+    expect(calls[0].body).toMatchObject({ token: 'r-token', token_type_hint: 'refresh_token' })
+
+    const down = async () => {
+      throw new Error('offline')
+    }
+    expect(await revokeApple({ refreshToken: 'r-token', clientId: AUD, key, fetcher: down })).toBe(false)
   })
 })

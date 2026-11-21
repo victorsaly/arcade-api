@@ -10,9 +10,14 @@ ALLOWED_ORIGINS = "https://shutthecube.com,https://delulubeats.com,https://victo
 # origin, and a sign-in started in one is returned to the app's own address.
 APP_ORIGINS = "capacitor://localhost,https://localhost"
 APP_REDIRECTS = "com.victorsaly.shutthecube://auth"
-# Bundle ids whose Sign in with Apple tokens are accepted. Empty until the
-# app has the capability; with none listed the endpoint answers 404.
-APPLE_AUDIENCES = ""
+# Bundle ids whose Sign in with Apple tokens are accepted. With none listed
+# the endpoint answers 404.
+APPLE_AUDIENCES = "com.victorsaly.shutthecube"
+# Which team and key sign the request that revokes an Apple sign-in when an
+# account is deleted. Both are identifiers, not secrets; the key itself is
+# the secret APPLE_PRIVATE_KEY.
+APPLE_TEAM_ID = "Z452L5C5VZ"
+APPLE_KEY_ID = "Q6U7WLLM9C"
 # Public by design — it travels in the redirect URL of every sign-in. The
 # matching secret is set with `wrangler secret put` and lives only at Cloudflare.
 GOOGLE_CLIENT_ID = "840152737364-1itggkdlsvd8gq3tc5t0p53ev6iuoqrt.apps.googleusercontent.com"
@@ -26,3 +31,4 @@ database_id = "849bc4ac-c545-4a9f-b7f4-62b41aa25eba"
 #   GOOGLE_CLIENT_ID
 #   GOOGLE_CLIENT_SECRET
 #   SESSION_SECRET
+#   APPLE_PRIVATE_KEY   the text of the Sign in with Apple .p8 key file
